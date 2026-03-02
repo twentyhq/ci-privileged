@@ -1,0 +1,125 @@
+name: Post Breaking Changes Comment
+
+on:
+  repository_dispatch:
+    types: [breaking-changes-report]
+
+jobs:
+  post-comment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TWENTY_TOKEN: ${{ secrets.TWENTY_PR_COMMENT_TOKEN }}
+    steps:
+      - name: Download breaking changes artifacts
+        env:
+          RUN_ID: ${{ github.event.client_payload.run_id }}
+          TARGET_REPO: ${{ github.event.client_payload.repo }}
+        run: |
+          echo "Downloading artifacts from run $RUN_ID..."
+
+          ARTIFACTS=$(curl -s -H "Authorization: Bearer $TWENTY_TOKEN" \
+            "https://api.github.com/repos/${TARGET_REPO}/actions/runs/${RUN_ID}/artifacts")
+
+          ARTIFACT_URL=$(echo "$ARTIFACTS" | jq -r \
+            '.artifacts[] | select(.name == "breaking-changes-report") | .archive_download_url // empty')
+
+          if [ -z "$ARTIFACT_URL" ]; then
+            echo "No breaking-changes-report artifact found"
+            exit 0
+          fi
+
+          curl -sL -H "Authorization: Bearer $TWENTY_TOKEN" "$ARTIFACT_URL" -o report.zip
+          unzip -o report.zip -d report/
+          echo "Downloaded artifacts:"
+          ls -la report/
+
+      - name: Post comment on PR
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          TARGET_REPO: ${{ github.event.client_payload.repo }}
+          BRANCH_STATE: ${{ github.event.client_payload.branch_state }}
+        with:
+          github-token: ${{ secrets.TWENTY_PR_COMMENT_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const [owner, repo] = process.env.TARGET_REPO.split('/');
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const branchState = process.env.BRANCH_STATE || 'unknown';
+
+            let hasChanges = false;
+            let comment = '';
+
+            const diffFiles = [
+              { path: 'report/graphql-schema-diff.md', label: '### GraphQL Schema Changes' },
+              { path: 'report/graphql-metadata-diff.md', label: '### GraphQL Metadata Schema Changes' },
+              { path: 'report/rest-api-diff.md', label: '' },
+              { path: 'report/rest-metadata-api-diff.md', label: '' },
+            ];
+
+            for (const { path, label } of diffFiles) {
+              if (fs.existsSync(path)) {
+                const content = fs.readFileSync(path, 'utf8');
+                if (content.trim()) {
+                  if (!hasChanges) {
+                    comment = '## 📊 API Changes Report\n\n';
+                    hasChanges = true;
+                  }
+                  comment += label ? label + '\n' + content + '\n\n' : content + '\n\n';
+                }
+              }
+            }
+
+            if (!hasChanges) {
+              console.log('No API changes detected - checking for existing comment to remove');
+              const {data: comments} = await github.rest.issues.listComments({ owner, repo, issue_number: prNumber });
+              const COMMENT_MARKER = '<!-- API_CHANGES_REPORT -->';
+              const botComment = comments.find(c => c.body.includes(COMMENT_MARKER));
+              if (botComment) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: botComment.id });
+              }
+              return;
+            }
+
+            let hasBreakingChanges = false;
+            const breakingIndicators = ['Breaking Changes', '🚨', 'Removed Endpoints', 'Changed Operations', 'BREAKING'];
+            for (const { path } of diffFiles) {
+              if (fs.existsSync(path)) {
+                const content = fs.readFileSync(path, 'utf8');
+                if (breakingIndicators.some(indicator => content.includes(indicator))) {
+                  hasBreakingChanges = true;
+                  break;
+                }
+              }
+            }
+
+            let branchStateNote = '';
+            if (branchState === 'conflicts') {
+              branchStateNote = '\n\n⚠️ **Note**: Could not merge with `main` due to conflicts. This comparison shows changes between the current branch and `main` as separate states.\n';
+            }
+
+            let breakingChangeNote = '';
+            if (hasBreakingChanges) {
+              breakingChangeNote = '\n\n## ⚠️ Breaking Change Protocol\n\n' +
+                '**Breaking changes detected.**\n\n' +
+                '🔄 **Options**:\n' +
+                '1. **If this IS a breaking change**: Add "breaking" to your PR title and add `BREAKING CHANGE:` to your commit message\n' +
+                '2. **If this is NOT a breaking change**: The API diff tool may have false positives - please review carefully\n\n' +
+                'For breaking changes, add to commit message:\n```\nfeat: add new API endpoint\n\nBREAKING CHANGE: removed deprecated field from User schema\n```';
+            }
+
+            const COMMENT_MARKER = '<!-- API_CHANGES_REPORT -->';
+            const commentBody = COMMENT_MARKER + '\n' + comment + branchStateNote +
+              '\n⚠️ **Please review these API changes carefully before merging.**' + breakingChangeNote;
+
+            const {data: comments} = await github.rest.issues.listComments({ owner, repo, issue_number: prNumber });
+            const botComment = comments.find(c => c.body.includes(COMMENT_MARKER));
+
+            if (botComment) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: botComment.id, body: commentBody });
+              console.log('Updated existing API changes comment');
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: commentBody });
+              console.log('Created new API changes comment');
+            }

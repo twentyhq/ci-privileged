@@ -1,0 +1,122 @@
+name: Post Preview Environment Comment
+
+on:
+  repository_dispatch:
+    types: [preview-env-url]
+
+jobs:
+  post-comment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TWENTY_TOKEN: ${{ secrets.TWENTY_PR_COMMENT_TOKEN }}
+    steps:
+      - name: Find keepalive workflow run
+        id: find-run
+        env:
+          DISPATCH_TIME: ${{ github.event.client_payload.keepalive_dispatch_time }}
+          TARGET_REPO: ${{ github.event.client_payload.repo }}
+        run: |
+          echo "Waiting for keepalive workflow to start..."
+          sleep 15
+
+          for attempt in $(seq 1 10); do
+            RUNS=$(curl -s -H "Authorization: Bearer $TWENTY_TOKEN" \
+              "https://api.github.com/repos/${TARGET_REPO}/actions/workflows/preview-env-keepalive.yaml/runs?event=repository_dispatch&status=in_progress&per_page=5")
+
+            RUN_ID=$(echo "$RUNS" | jq -r --arg dt "$DISPATCH_TIME" \
+              '[.workflow_runs[] | select(.created_at >= $dt)] | sort_by(.created_at) | reverse | .[0].id // empty')
+
+            if [ -n "$RUN_ID" ]; then
+              echo "Found keepalive run: $RUN_ID"
+              echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+              break
+            fi
+
+            echo "Keepalive run not found yet, waiting 10s... (attempt $attempt/10)"
+            sleep 10
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not find keepalive workflow run"
+            exit 1
+          fi
+
+      - name: Poll for tunnel URL artifact
+        id: get-url
+        env:
+          RUN_ID: ${{ steps.find-run.outputs.run_id }}
+          TARGET_REPO: ${{ github.event.client_payload.repo }}
+        run: |
+          echo "Polling for tunnel-url artifact on run $RUN_ID..."
+
+          for attempt in $(seq 1 30); do
+            ARTIFACTS=$(curl -s -H "Authorization: Bearer $TWENTY_TOKEN" \
+              "https://api.github.com/repos/${TARGET_REPO}/actions/runs/${RUN_ID}/artifacts")
+
+            ARTIFACT_URL=$(echo "$ARTIFACTS" | jq -r \
+              '.artifacts[] | select(.name == "tunnel-url") | .archive_download_url // empty')
+
+            if [ -n "$ARTIFACT_URL" ]; then
+              echo "Found tunnel-url artifact, downloading..."
+              curl -sL -H "Authorization: Bearer $TWENTY_TOKEN" "$ARTIFACT_URL" -o tunnel-url.zip
+              unzip -o tunnel-url.zip
+              TUNNEL_URL=$(cat tunnel-url.txt)
+              echo "tunnel_url=$TUNNEL_URL" >> "$GITHUB_OUTPUT"
+              echo "Tunnel URL: $TUNNEL_URL"
+              break
+            fi
+
+            echo "Artifact not ready yet, waiting 30s... (attempt $attempt/30)"
+            sleep 30
+          done
+
+          if [ -z "$ARTIFACT_URL" ]; then
+            echo "Timed out waiting for tunnel-url artifact"
+            exit 1
+          fi
+
+      - name: Post comment on PR
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          TUNNEL_URL: ${{ steps.get-url.outputs.tunnel_url }}
+          TARGET_REPO: ${{ github.event.client_payload.repo }}
+        with:
+          github-token: ${{ secrets.TWENTY_PR_COMMENT_TOKEN }}
+          script: |
+            const COMMENT_MARKER = '<!-- PR_PREVIEW_ENV -->';
+            const [owner, repo] = process.env.TARGET_REPO.split('/');
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const tunnelUrl = process.env.TUNNEL_URL;
+
+            const commentBody = `${COMMENT_MARKER}
+            🚀 **Preview Environment Ready!**
+
+            Your preview environment is available at: ${tunnelUrl}
+
+            This environment will automatically shut down after 5 hours.`;
+
+            const {data: comments} = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number: prNumber,
+            });
+
+            const botComment = comments.find(c => c.body.includes(COMMENT_MARKER));
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: botComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body: commentBody
+              });
+            }
