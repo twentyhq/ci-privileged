@@ -16,7 +16,7 @@ jobs:
           TARGET_ISSUE: ${{ github.event.client_payload.issue_number }}
           RUN_URL: ${{ github.event.client_payload.run_url }}
         with:
-          github-token: ${{ secrets.TWENTY_DISPATCH_TOKEN }}
+          github-token: ${{ secrets.CORE_TEAM_ISSUES_COMMENT_TOKEN }}
           script: |
             const [owner, repo] = process.env.TARGET_REPO.split('/');
             const issueNumber = parseInt(process.env.TARGET_ISSUE, 10);

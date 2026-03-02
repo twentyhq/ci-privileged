@@ -24,4 +24,4 @@ This repo isolates write tokens from the main twenty repository. Workflows here 
 | Secret | Scope | Purpose |
 |--------|-------|---------|
 | `TWENTY_PR_COMMENT_TOKEN` | `pull-requests: write` + `actions: read` on twentyhq/twenty | Post PR comments and download workflow artifacts |
-| `TWENTY_DISPATCH_TOKEN` | Write access on twentyhq/core-team-issues | Post comments on core-team-issues |
+| `CORE_TEAM_ISSUES_COMMENT_TOKEN` | Write access on twentyhq/core-team-issues | Post comments on core-team-issues |
